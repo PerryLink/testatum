@@ -1,0 +1,29 @@
+{
+  "name": "testatum",
+  "version": "0.1.0",
+  "description": "Static supply-chain checker for DSH plugin artifacts (single file, zero runtime deps). Experimental: not a security gate.",
+  "type": "module",
+  "bin": {
+    "testatum": "./testatum.mjs"
+  },
+  "scripts": {
+    "test": "node test/run.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "files": [
+    "testatum.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PerryLink/testatum.git"
+  },
+  "homepage": "https://github.com/PerryLink/testatum#readme",
+  "bugs": {
+    "url": "https://github.com/PerryLink/testatum/issues"
+  }
+}
