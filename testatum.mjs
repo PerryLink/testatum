@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 /**
- * testatum v0.1 — a single-file, zero-dependency supply-chain checker prototype.
+ * testatum v0.2 — a single-file, zero-dependency supply-chain checker prototype.
  *
  * Scope (deliberately small):
  *   - static inspection only; package code and lifecycle scripts are NEVER executed
- *   - no cryptographic signature or provenance verification
- *   - no revocation-feed fetching or verification
+ *   - SBOM generation (CycloneDX 1.5) from a tarball or local source tree
+ *   - on-demand OSV advisory lookup via the public API (never cached)
+ *   - provenance/attestation PRESENCE only; no cryptographic verification
  *
  * Exit codes (also printed by `testatum policy`):
  *   0 = pass, 1 = fail, 2 = unknown (including "evidence could not be verified")
@@ -18,18 +19,24 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { basename, join, resolve, sep } from 'node:path'
 import { gunzipSync } from 'node:zlib'
 
-const VERSION = '0.1.0'
+const VERSION = '0.2.0'
 const SCHEMA = 'testatum/1'
 const REGISTRY = (process.env.TESTATUM_REGISTRY || 'https://registry.npmjs.org').replace(/\/+$/, '')
+const OSV_API = process.env.TESTATUM_OSV_API || 'https://api.osv.dev/v1/query'
+const CDX_SPEC_VERSION = '1.5'
+const CDX_SCHEMA = 'http://cyclonedx.org/schema/bom-1.5.schema.json'
 const MAX_TARBALL_BYTES = 32 * 1024 * 1024
 const MAX_JSON_BYTES = 8 * 1024 * 1024
 const FETCH_TIMEOUT_MS = 30_000
+const MAX_SBOM_FILES = 20_000
+const MAX_SBOM_FILE_BYTES = 16 * 1024 * 1024
+const MAX_SBOM_COMPONENTS = 2_000
 
 const LIFECYCLE = ['preinstall', 'install', 'postinstall', 'prepare']
 const LOCKFILES = ['package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lockb']
 
 // Partial closed set. Unknown-but-well-formed IDs are reported as UNKNOWN rather
-// than silently promoted to PASS; v0.1 does not claim the set is authoritative.
+// than silently promoted to PASS; v0.2 does not claim the set is authoritative.
 const KNOWN_CAPABILITIES = new Set([
   'tools:register',
   'tools:unregister',
@@ -63,11 +70,14 @@ const HIGH_RISK_CAPABILITIES = new Set([
 
 const LIMITATIONS = [
   'Static inspection only: package code and lifecycle scripts are never executed.',
-  'v0.1 does not cryptographically verify signatures or provenance; presence is UNKNOWN, never PASS.',
-  'Revocation feeds are not fetched or verified in v0.1; absence is UNKNOWN, not PASS.',
+  'v0.2 does not cryptographically verify signatures or provenance; attestation presence is evidence only, and the provenance check is always UNKNOWN.',
+  'Revocation comes from the unsigned public OSV API. It is not a signed revocation list, and a PASS is only a point-in-time advisory query, never a proof that a version is safe.',
+  'OSV results are never cached: every revocation invocation performs a fresh query. Network failure is UNKNOWN, not PASS.',
+  'SBOMs are generated locally and are unsigned/not attested. For npm tarballs, dependency versions are declared semver ranges unless the tarball ships a lockfile; runtime dependency coverage is then partial.',
+  'Local-directory file inventories exclude node_modules/.git/.cache/coverage and never hash symlinks; npm-tarball inventories cover the package payload only.',
   'Capability checks cover declaration shape and dangerous literals, not AST or runtime behavior.',
   'pnpm/yarn lockfile integrity coverage is heuristic; package-lock parsing is structural.',
-  'Registry metadata and tarballs are point-in-time evidence; pin the verified digest before install.',
+  'Registry metadata, tarballs and OSV responses are point-in-time evidence; pin the verified digest before install.',
 ]
 
 // ---------------------------------------------------------------------------
@@ -90,6 +100,37 @@ function sha1Hex(buffer) {
   return createHash('sha1').update(buffer).digest('hex')
 }
 
+function sha256Hex(buffer) {
+  return createHash('sha256').update(buffer).digest('hex')
+}
+
+function sha512Hex(buffer) {
+  return createHash('sha512').update(buffer).digest('hex')
+}
+
+function deterministicUrn(seed) {
+  const bytes = createHash('sha256').update(seed).digest().subarray(0, 16)
+  bytes[6] = (bytes[6] & 0x0f) | 0x50
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = bytes.toString('hex')
+  return `urn:uuid:${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+function purlFor(name, version) {
+  if (typeof name !== 'string' || !name) return null
+  let encoded
+  if (name.startsWith('@')) {
+    const body = name.slice(1)
+    const slash = body.indexOf('/')
+    encoded = slash < 0
+      ? `%40${encodeURIComponent(body)}`
+      : `%40${encodeURIComponent(body.slice(0, slash))}/${encodeURIComponent(body.slice(slash + 1))}`
+  } else {
+    encoded = encodeURIComponent(name)
+  }
+  return `pkg:npm/${encoded}${version ? `@${encodeURIComponent(version)}` : ''}`
+}
+
 function extractSha512(integrity) {
   if (typeof integrity !== 'string') return null
   for (const token of integrity.trim().split(/\s+/)) {
@@ -101,6 +142,13 @@ function extractSha512(integrity) {
 function short(value, limit = 160) {
   const text = String(value ?? '')
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text
+}
+
+function describeError(error) {
+  const message = error?.message || String(error)
+  const cause = error?.cause
+  if (typeof cause?.code === 'string' && cause.code) return `${message} (${cause.code})`
+  return message
 }
 
 function makeCheck(id, title, status, reason, evidence) {
@@ -134,6 +182,27 @@ async function fetchJson(url, timeoutMs = FETCH_TIMEOUT_MS) {
       accept: 'application/json',
       'user-agent': `testatum/${VERSION}`,
     },
+    signal: AbortSignal.timeout(timeoutMs),
+  })
+  if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`)
+  const text = await response.text()
+  if (text.length > MAX_JSON_BYTES) throw new Error(`response too large (${text.length} bytes) for ${url}`)
+  try {
+    return JSON.parse(text)
+  } catch (error) {
+    throw new Error(`invalid JSON from ${url}: ${error.message}`)
+  }
+}
+
+async function postJson(url, payload, timeoutMs = FETCH_TIMEOUT_MS) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/json',
+      'user-agent': `testatum/${VERSION}`,
+    },
+    body: JSON.stringify(payload),
     signal: AbortSignal.timeout(timeoutMs),
   })
   if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`)
@@ -295,9 +364,40 @@ function tarballStats(tar) {
   }
 }
 
+function normalizeTarPath(name) {
+  return String(name || '').replace(/^\.\//, '').replace(/^package\//, '')
+}
+
+function readTarText(tar, exactPath) {
+  const entry = tar.entries.find((item) => item.type !== '5' && normalizeTarPath(item.name) === exactPath)
+  if (!entry) return null
+  return tar.buffer.subarray(entry.dataStart, Math.min(entry.dataStart + entry.size, tar.buffer.length)).toString('utf8')
+}
+
+function tarFileInventory(tar, maxFiles = MAX_SBOM_FILES) {
+  const files = new Map()
+  for (const entry of tar.entries) {
+    if (entry.type !== '0' && entry.type !== '7') continue
+    const relative = normalizeTarPath(entry.name)
+    if (!relative) continue
+    const data = tar.buffer.subarray(entry.dataStart, Math.min(entry.dataStart + entry.size, tar.buffer.length))
+    files.set(relative, { path: relative, size: data.length, sha256: sha256Hex(data) })
+    if (files.size >= maxFiles) {
+      return { files: [...files.values()].sort((a, b) => a.path.localeCompare(b.path)), truncated: true }
+    }
+  }
+  return { files: [...files.values()].sort((a, b) => a.path.localeCompare(b.path)), truncated: false }
+}
+
+function filesDigest(files) {
+  const hash = createHash('sha256')
+  for (const file of files) hash.update(`${file.path}\0${file.size}\0${file.sha256}\n`)
+  return hash.digest('hex')
+}
+
 async function loadTarball(meta) {
   const url = meta?.dist?.tarball
-  if (typeof url !== 'string' || !url) return { buffer: null, error: 'dist.tarball missing' }
+  if (typeof url !== 'string' || !url) return { buffer: null, tar: null, error: 'dist.tarball missing' }
   try {
     const buffer = await fetchBuffer(url)
     try {
@@ -305,16 +405,17 @@ async function loadTarball(meta) {
       const parsed = readTarManifest(tar)
       return {
         buffer,
+        tar,
         manifest: parsed?.manifest || null,
         manifestPath: parsed?.path || null,
         stats: tarballStats(tar),
         error: null,
       }
     } catch (error) {
-      return { buffer, manifest: null, stats: null, error: `tarball parse failed: ${error.message}` }
+      return { buffer, tar: null, manifest: null, stats: null, error: `tarball parse failed: ${error.message}` }
     }
   } catch (error) {
-    return { buffer: null, manifest: null, stats: null, error: error.message }
+    return { buffer: null, tar: null, manifest: null, stats: null, error: error.message }
   }
 }
 
@@ -364,6 +465,27 @@ function walkFiles(root, maxFiles = 20_000) {
   }
   files.sort()
   return { files, truncated }
+}
+
+function localFileInventory(dir, maxFiles = MAX_SBOM_FILES) {
+  const walk = walkFiles(dir, maxFiles)
+  const files = []
+  let unreadable = 0
+  let oversized = 0
+  for (const relative of walk.files) {
+    const absolute = join(dir, relative)
+    try {
+      if (statSync(absolute).size > MAX_SBOM_FILE_BYTES) {
+        oversized += 1
+        continue
+      }
+      const data = readFileSync(absolute)
+      files.push({ path: relative, size: data.length, sha256: sha256Hex(data) })
+    } catch {
+      unreadable += 1
+    }
+  }
+  return { files, truncated: walk.truncated, unreadable, oversized, scope: 'source-tree' }
 }
 
 // ---------------------------------------------------------------------------
@@ -611,7 +733,7 @@ function checkLocalIntegrity(dir) {
       return checkYarnLockfile(dir, name, readFileSync(join(dir, name), 'utf8'), evidence)
     }
     return makeCheck('SC-07', 'dependency lockfile integrity', 'UNKNOWN',
-      `${name} is a binary lockfile; v0.1 does not parse it`, evidence)
+      `${name} is a binary lockfile; testatum does not parse it`, evidence)
   } catch (error) {
     return makeCheck('SC-07', 'dependency lockfile integrity', 'FAIL',
       `cannot parse ${name}: ${error.message}`, evidence)
@@ -665,36 +787,78 @@ function checkRemoteIntegrity(meta, artifact) {
 async function checkProvenance(meta, artifact) {
   const dist = isObject(meta.dist) ? meta.dist : {}
   const declared = artifact.manifest?.dsh?.attestation
+  const hasAttestations = hasOwn(dist, 'attestations') && dist.attestations !== null && dist.attestations !== false
+  const url = isObject(dist.attestations) && typeof dist.attestations.url === 'string'
+    ? dist.attestations.url
+    : null
+  const declaredPredicate = isObject(dist.attestations?.provenance)
+    ? dist.attestations.provenance.predicateType ?? null
+    : null
   const evidence = {
+    present: Boolean(hasAttestations),
+    verified: false,
+    verification: 'not-implemented',
+    status: hasAttestations ? 'present-unverified' : 'absent',
     npmAttestations: dist.attestations ?? null,
-    declaredInManifest: declared ? true : false,
+    url,
+    declaredPredicateType: declaredPredicate,
+    declaredInManifest: Boolean(declared),
+    fetched: null,
+    failure: null,
   }
-  if (!dist.attestations) {
+  if (!hasAttestations) {
     const suffix = declared ? '; self-declared dsh.attestation is unverified' : ''
     return makeCheck('SC-07', 'provenance', 'UNKNOWN',
-      `no npm provenance; source/commit/builder cannot be bound${suffix}`, evidence)
+      `no npm provenance; source/commit/builder cannot be bound${suffix}; testatum does not verify provenance (UNKNOWN)`,
+      evidence)
   }
-  if (!isObject(dist.attestations) || typeof dist.attestations.url !== 'string') {
+  if (!url) {
     return makeCheck('SC-07', 'provenance', 'UNKNOWN',
-      'dist.attestations declared but has no attestation URL', evidence)
+      'npm attestations field present but has no attestation URL; presence recorded, testatum does not verify provenance (UNKNOWN)',
+      evidence)
   }
   try {
-    const bundle = await fetchJson(dist.attestations.url)
+    const bundle = await fetchJson(url)
     const list = Array.isArray(bundle.attestations) ? bundle.attestations : []
+    const predicateTypes = [...new Set(list.map((item) => item?.predicateType).filter(Boolean))]
     evidence.fetched = {
       count: list.length,
-      predicateTypes: [...new Set(list.map((item) => item?.predicateType).filter(Boolean))],
+      predicateTypes,
       mediaTypes: [...new Set(list.map((item) => item?.bundle?.mediaType).filter(Boolean))],
     }
     if (!list.length) {
+      evidence.status = 'present-empty'
       return makeCheck('SC-07', 'provenance', 'UNKNOWN',
-        'attestation endpoint returned no attestations', evidence)
+        'npm attestations field present but the endpoint returned no attestations; testatum does not verify provenance (UNKNOWN)',
+        evidence)
     }
+    evidence.status = 'present-unverified'
     return makeCheck('SC-07', 'provenance', 'UNKNOWN',
-      `npm attestation present (${list.length} bundle(s)) but v0.1 does not verify the bundle`, evidence)
+      `npm attestation present (${list.length} bundle(s)); testatum does not verify the bundle (presence only, UNKNOWN)`,
+      evidence)
   } catch (error) {
+    evidence.status = 'present-unreachable'
+    evidence.failure = short(describeError(error), 160)
     return makeCheck('SC-07', 'provenance', 'UNKNOWN',
-      `npm attestation declared but unreachable: ${short(error.message, 100)}`, evidence)
+      `npm attestation present but unreachable (${short(describeError(error), 100)}); testatum does not verify the bundle (UNKNOWN)`,
+      evidence)
+  }
+}
+
+function provenanceSummary(check) {
+  const evidence = isObject(check.evidence) ? check.evidence : {}
+  return {
+    present: Boolean(evidence.present),
+    verified: false,
+    verification: 'not-implemented',
+    status: evidence.status || (evidence.present ? 'present-unverified' : 'absent'),
+    source: evidence.present ? 'npm-attestations' : 'none',
+    url: evidence.url ?? null,
+    declaredPredicateType: evidence.declaredPredicateType ?? null,
+    bundleCount: evidence.fetched?.count ?? null,
+    predicateTypes: evidence.fetched?.predicateTypes ?? [],
+    declaredInManifest: Boolean(evidence.declaredInManifest),
+    reason: check.reason,
   }
 }
 
@@ -706,14 +870,15 @@ function checkSignature(meta, artifact) {
     npmSignatureCount: npmSignatures.length,
     npmKeyids: [...new Set(npmSignatures.map((item) => item?.keyid).filter(Boolean))],
     declaredInManifest: declared ? true : false,
+    verified: false,
   }
   if (npmSignatures.length) {
     return makeCheck('SC-01', 'publisher signature', 'UNKNOWN',
-      `${npmSignatures.length} npm registry signature(s) present; v0.1 does not verify them`, evidence)
+      `${npmSignatures.length} npm registry signature(s) present; testatum does not verify them (UNKNOWN)`, evidence)
   }
   if (declared) {
     return makeCheck('SC-01', 'publisher signature', 'UNKNOWN',
-      'self-declared signature/attestation field present; unverified', evidence)
+      'self-declared signature/attestation field present; testatum does not verify it (UNKNOWN)', evidence)
   }
   return makeCheck('SC-01', 'publisher signature', 'UNKNOWN',
     'no signature declared; cannot bind publisher identity to the artifact', evidence)
@@ -723,7 +888,7 @@ function checkSignature(meta, artifact) {
 // report assembly
 // ---------------------------------------------------------------------------
 
-function buildReport({ command, target, checks, evidence = {}, error = null }) {
+function buildReport({ command, target, checks, evidence = {}, error = null, sbom = null, revocation = null, provenance = null }) {
   const summary = {
     pass: checks.filter((check) => check.status === 'PASS').length,
     fail: checks.filter((check) => check.status === 'FAIL').length,
@@ -748,6 +913,11 @@ function buildReport({ command, target, checks, evidence = {}, error = null }) {
     summary,
     checks,
     evidence,
+    // v0.2 additive fields. They are always present (null when not applicable)
+    // so consumers of testatum/1 can rely on a stable key set.
+    sbom,
+    revocation,
+    provenance,
     limitations: LIMITATIONS,
   }
   if (error) report.error = short(error, 500)
@@ -773,9 +943,520 @@ function renderSummary(report) {
   for (const check of report.checks) {
     lines.push(`  ${check.status.padEnd(7)} ${check.id.padEnd(9)} ${check.title}: ${check.reason}`)
   }
+  if (report.sbom) {
+    const sbomEvidence = report.evidence?.sbom || {}
+    lines.push(`  sbom: CycloneDX ${report.sbom.specVersion} · ${sbomEvidence.componentCount ?? '?'} component(s) · ` +
+      `${sbomEvidence.fileCount ?? '?'} file(s) · ${sbomEvidence.filesDigest ?? 'no digest'} · coverage ${sbomEvidence.coverage ?? '?'} · unsigned`)
+  }
+  if (report.revocation) {
+    lines.push(`  revocation: ${report.revocation.status} · ${report.revocation.advisoryCount ?? 0} active advisory(ies) · ` +
+      `source ${report.revocation.source} (${report.revocation.cache})`)
+  }
+  if (report.provenance) {
+    lines.push(`  provenance: ${report.provenance.present ? 'present' : 'absent'} · verified ${report.provenance.verified} · ` +
+      `${report.provenance.status} · ${report.provenance.bundleCount ?? '?'} bundle(s)`)
+  }
   if (report.error) lines.push(`  error: ${report.error}`)
-  lines.push('  note: static checks only; no cryptographic signature/provenance verification in v0.1')
+  lines.push('  note: no cryptographic signature/provenance verification in v0.2; OSV advisories are unsigned and never cached')
   return lines.join('\n')
+}
+
+// ---------------------------------------------------------------------------
+// SBOM (CycloneDX 1.5) generation
+// ---------------------------------------------------------------------------
+
+function licenseEntries(value) {
+  if (typeof value === 'string' && value.trim()) {
+    const text = value.trim()
+    if (/^[A-Za-z0-9.+-]+$/.test(text) && !/^SEE LICENSE IN/i.test(text)) {
+      return [{ license: { id: text } }]
+    }
+    return [{ license: { name: text } }]
+  }
+  if (isObject(value) && typeof value.type === 'string' && value.type.trim()) {
+    return licenseEntries(value.type)
+  }
+  if (Array.isArray(value)) {
+    const entries = value.flatMap((item) => licenseEntries(item) || [])
+    return entries.length ? entries : null
+  }
+  return null
+}
+
+function integrityToHashes(integrity) {
+  if (typeof integrity !== 'string' || !integrity.trim()) return []
+  const algorithms = {
+    sha1: ['SHA-1', 40],
+    sha256: ['SHA-256', 64],
+    sha384: ['SHA-384', 96],
+    sha512: ['SHA-512', 128],
+  }
+  const hashes = []
+  for (const token of integrity.trim().split(/\s+/)) {
+    const clean = token.split('?')[0]
+    const dash = clean.indexOf('-')
+    if (dash <= 0) continue
+    const algorithm = algorithms[clean.slice(0, dash).toLowerCase()]
+    if (!algorithm) continue
+    const content = clean.slice(dash + 1)
+    const hex = Buffer.from(content, 'base64').toString('hex')
+    if (!new RegExp(`^[a-f0-9]{${algorithm[1]}}$`).test(hex)) continue
+    hashes.push({ alg: algorithm[0], content: hex })
+  }
+  return hashes
+}
+
+function packageNameFromLockPath(key) {
+  const marker = 'node_modules/'
+  const index = key.lastIndexOf(marker)
+  if (index < 0) return null
+  const rest = key.slice(index + marker.length)
+  if (rest.startsWith('@')) {
+    const parts = rest.split('/')
+    return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : null
+  }
+  return rest.split('/')[0] || null
+}
+
+function lockDependencyType(value) {
+  if (value?.dev === true) return 'dev'
+  if (value?.optional === true) return 'optional'
+  if (value?.peer === true) return 'peer'
+  return 'runtime'
+}
+
+function componentsFromNpmLock(lock, source) {
+  const components = []
+  const seen = new Set()
+  const push = (name, value, fallbackVersion = null) => {
+    if (!name) return
+    if (value?.link === true) return
+    if (typeof value?.resolved === 'string' && value.resolved.startsWith('file:')) return
+    const version = typeof value?.version === 'string' && value.version ? value.version : fallbackVersion
+    const dependencyType = lockDependencyType(value)
+    const key = `${name}@${version || ''}`
+    if (seen.has(key)) return
+    seen.add(key)
+    components.push({
+      name,
+      version: version || null,
+      versionSpec: typeof value?.version === 'string' ? value.version : null,
+      resolved: Boolean(version),
+      hashes: integrityToHashes(value?.integrity),
+      license: licenseEntries(value?.license),
+      integrity: value?.integrity ?? null,
+      dependencyType,
+      scope: dependencyType === 'dev' ? 'excluded' : dependencyType === 'optional' || dependencyType === 'peer' ? 'optional' : 'required',
+      source,
+    })
+  }
+
+  if (isObject(lock.packages)) {
+    for (const [key, value] of Object.entries(lock.packages)) {
+      if (!key || !key.includes('node_modules/')) continue
+      push(packageNameFromLockPath(key) || value?.name, value)
+    }
+  } else if (isObject(lock.dependencies)) {
+    const visit = (dependencies) => {
+      for (const [name, value] of Object.entries(dependencies || {})) {
+        push(name, value)
+        if (isObject(value?.dependencies)) visit(value.dependencies)
+      }
+    }
+    visit(lock.dependencies)
+  }
+  components.sort((a, b) => `${a.name}@${a.version}`.localeCompare(`${b.name}@${b.version}`))
+  return components.slice(0, MAX_SBOM_COMPONENTS)
+}
+
+function componentsFromManifest(manifest, source) {
+  const groups = [
+    ['dependencies', 'runtime', 'required'],
+    ['optionalDependencies', 'optional', 'optional'],
+    ['peerDependencies', 'peer', 'optional'],
+  ]
+  if (source === 'dir') groups.push(['devDependencies', 'dev', 'excluded'])
+  const components = []
+  const seen = new Map()
+  for (const [field, dependencyType, scope] of groups) {
+    if (!isObject(manifest[field])) continue
+    for (const [name, spec] of Object.entries(manifest[field])) {
+      if (typeof spec !== 'string' || !spec.trim()) continue
+      const existing = seen.get(name)
+      if (existing) {
+        // Runtime declarations win over optional/peer/dev duplicates.
+        const priority = { runtime: 0, optional: 1, peer: 2, dev: 3 }
+        if (priority[dependencyType] < priority[existing.dependencyType]) {
+          existing.versionSpec = spec
+          existing.dependencyType = dependencyType
+          existing.scope = scope
+        }
+        continue
+      }
+      const component = {
+        name,
+        version: null,
+        versionSpec: spec,
+        resolved: false,
+        hashes: [],
+        license: null,
+        integrity: null,
+        dependencyType,
+        scope,
+        source: 'package.json-range',
+      }
+      seen.set(name, component)
+      components.push(component)
+    }
+  }
+  components.sort((a, b) => a.name.localeCompare(b.name))
+  return components.slice(0, MAX_SBOM_COMPONENTS)
+}
+
+function loadLocalSbomComponents(dir, manifest) {
+  const found = LOCKFILES.filter((name) => existsSync(join(dir, name)))
+  if (found.length === 1 && (found[0] === 'package-lock.json' || found[0] === 'npm-shrinkwrap.json')) {
+    try {
+      const lock = JSON.parse(readFileSync(join(dir, found[0]), 'utf8'))
+      return {
+        components: componentsFromNpmLock(lock, found[0]),
+        resolution: 'lockfile',
+        lockfile: found[0],
+        warning: null,
+      }
+    } catch (error) {
+      return {
+        components: componentsFromManifest(manifest, 'dir'),
+        resolution: 'declared-ranges',
+        lockfile: found[0],
+        warning: `cannot parse ${found[0]}: ${error.message}`,
+      }
+    }
+  }
+  const warning = found.length > 1
+    ? `multiple lockfiles present: ${found.join(', ')}`
+    : found.length === 1
+      ? `${found[0]} is not resolved by v0.2; dependency versions are declared ranges`
+      : 'no lockfile; dependency versions are declared ranges'
+  return {
+    components: componentsFromManifest(manifest, 'dir'),
+    resolution: 'declared-ranges',
+    lockfile: found[0] ?? null,
+    warning,
+  }
+}
+
+function evaluateSbomCoverage({ components, inventory, rootLicense, componentsTruncated = false }) {
+  const gaps = []
+  if (inventory.truncated) gaps.push(`file inventory truncated at ${inventory.files.length} files`)
+  if (inventory.unreadable) gaps.push(`${inventory.unreadable} file(s) unreadable`)
+  if (inventory.oversized) gaps.push(`${inventory.oversized} file(s) exceed ${MAX_SBOM_FILE_BYTES} bytes and were not hashed`)
+  if (!rootLicense) gaps.push('root component has no license')
+  if (componentsTruncated) gaps.push(`component list truncated at ${MAX_SBOM_COMPONENTS}`)
+  const runtime = components.filter((component) => component.dependencyType !== 'dev')
+  const unresolved = runtime.filter((component) => !component.version)
+  const missingHashes = runtime.filter((component) => component.version && component.hashes.length === 0)
+  const missingLicenses = runtime.filter((component) => component.version && !component.license)
+  if (unresolved.length) {
+    gaps.push(`${unresolved.length} runtime component(s) have unresolved versions (${unresolved.slice(0, 3).map((item) => item.name).join(', ')}${unresolved.length > 3 ? ', …' : ''})`)
+  }
+  if (missingHashes.length) {
+    gaps.push(`${missingHashes.length} resolved runtime component(s) have no hash`)
+  }
+  if (missingLicenses.length) {
+    gaps.push(`${missingLicenses.length} resolved runtime component(s) have no license`)
+  }
+  return {
+    coverage: gaps.length ? 'partial' : 'full',
+    gaps,
+    runtimeComponents: runtime.length,
+    unresolvedRuntime: unresolved.length,
+    missingHashComponents: missingHashes.length,
+    missingLicenseComponents: missingLicenses.length,
+  }
+}
+
+function buildCycloneDx({ name, version, source, rootHashes, rootLicense, components, inventory, coverage, distributionUrl, repositoryUrl, extraProperties = [] }) {
+  const rootPurl = purlFor(name, version)
+  const digest = filesDigest(inventory.files)
+  const usedRefs = new Set(rootPurl ? [rootPurl] : [])
+  const cdxComponents = components.map((component, index) => {
+    const purl = purlFor(component.name, component.version)
+    let ref = purl || `component:${index}`
+    if (usedRefs.has(ref)) ref = `${ref}#${index}`
+    usedRefs.add(ref)
+    const properties = [
+      { name: 'testatum:dependencyType', value: component.dependencyType },
+      { name: 'testatum:resolved', value: String(Boolean(component.version)) },
+    ]
+    if (component.versionSpec) properties.push({ name: 'testatum:versionSpec', value: component.versionSpec })
+    return {
+      type: 'library',
+      'bom-ref': ref,
+      name: component.name,
+      ...(component.version ? { version: component.version } : {}),
+      ...(purl ? { purl } : {}),
+      scope: component.scope,
+      ...(component.hashes.length ? { hashes: component.hashes } : {}),
+      ...(component.license ? { licenses: component.license } : {}),
+      properties,
+    }
+  })
+  const rootReferences = []
+  if (distributionUrl) rootReferences.push({ type: 'distribution', url: distributionUrl })
+  if (repositoryUrl) rootReferences.push({ type: 'vcs', url: repositoryUrl })
+  const rootProperties = [
+    { name: 'testatum:fileInventoryScope', value: source === 'npm' ? 'tarball-payload' : 'source-tree' },
+    { name: 'testatum:filesDigest', value: `sha256:${digest}` },
+    { name: 'testatum:hashMeaning', value: source === 'npm' ? 'tarball-bytes' : 'source-tree-sha256' },
+  ]
+  const rootComponent = {
+    type: 'library',
+    'bom-ref': rootPurl,
+    name,
+    version,
+    purl: rootPurl,
+    hashes: rootHashes,
+    ...(rootLicense ? { licenses: rootLicense } : {}),
+    ...(rootReferences.length ? { externalReferences: rootReferences } : {}),
+    properties: rootProperties,
+  }
+  const document = {
+    $schema: CDX_SCHEMA,
+    bomFormat: 'CycloneDX',
+    specVersion: CDX_SPEC_VERSION,
+    serialNumber: deterministicUrn(`${name}@${version}|${source}|${digest}`),
+    version: 1,
+    metadata: {
+      tools: {
+        components: [{ type: 'application', name: 'testatum', version: VERSION }],
+      },
+      component: rootComponent,
+    },
+    components: cdxComponents,
+    dependencies: [{
+      ref: rootPurl,
+      dependsOn: cdxComponents.map((component) => component['bom-ref']),
+    }],
+    properties: [
+      { name: 'testatum:source', value: source },
+      { name: 'testatum:fileCount', value: String(inventory.files.length) },
+      { name: 'testatum:filesDigest', value: `sha256:${digest}` },
+      { name: 'testatum:filesTruncated', value: String(Boolean(inventory.truncated)) },
+      { name: 'testatum:coverage', value: coverage.coverage },
+      { name: 'testatum:sbomSigned', value: 'false' },
+      { name: 'testatum:sbomAttested', value: 'false' },
+      ...extraProperties,
+    ],
+  }
+  return { document, digest }
+}
+
+function validateCycloneDx(document) {
+  const issues = []
+  const hashPattern = {
+    'SHA-1': /^[a-f0-9]{40}$/,
+    'SHA-256': /^[a-f0-9]{64}$/,
+    'SHA-384': /^[a-f0-9]{96}$/,
+    'SHA-512': /^[a-f0-9]{128}$/,
+  }
+  if (document?.bomFormat !== 'CycloneDX') issues.push('bomFormat must be CycloneDX')
+  if (document?.specVersion !== CDX_SPEC_VERSION) issues.push(`specVersion must be ${CDX_SPEC_VERSION}`)
+  if (document?.version !== 1) issues.push('version must be 1')
+  if (typeof document?.serialNumber !== 'string' || !/^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(document.serialNumber)) {
+    issues.push('serialNumber is not a lowercase RFC-4122 urn:uuid')
+  }
+  const root = document?.metadata?.component
+  if (!isObject(root) || typeof root.name !== 'string' || !root.name || typeof root.version !== 'string' || !root.version) {
+    issues.push('metadata.component must carry name and version')
+  } else {
+    if (!Array.isArray(root.hashes) || !root.hashes.length) issues.push('metadata.component.hashes is empty')
+    if (!Array.isArray(root.properties)) issues.push('metadata.component.properties must be an array')
+  }
+  const refs = new Set()
+  for (const [index, component] of (document?.components || []).entries()) {
+    if (!isObject(component) || typeof component.name !== 'string' || !component.name) {
+      issues.push(`components[${index}].name missing`)
+    }
+    if (!component || component.type !== 'library') issues.push(`components[${index}].type must be library`)
+    if (component?.['bom-ref']) {
+      if (refs.has(component['bom-ref'])) issues.push(`duplicate bom-ref ${component['bom-ref']}`)
+      refs.add(component['bom-ref'])
+    }
+    for (const hash of component?.hashes || []) {
+      const pattern = hashPattern[hash.alg]
+      if (!pattern || !pattern.test(String(hash.content || ''))) issues.push(`components[${index}] has an invalid ${hash.alg} hash`)
+    }
+  }
+  for (const [index, hash] of (root?.hashes || []).entries()) {
+    const pattern = hashPattern[hash.alg]
+    if (!pattern || !pattern.test(String(hash.content || ''))) issues.push(`metadata.component.hashes[${index}] is invalid (${hash.alg})`)
+  }
+  for (const dependency of document?.dependencies || []) {
+    if (dependency.ref !== root?.purl) issues.push(`dependencies ref ${dependency.ref} is not the root purl`)
+    for (const ref of dependency.dependsOn || []) {
+      if (!refs.has(ref)) issues.push(`dependencies dependsOn unknown ref ${ref}`)
+    }
+  }
+  for (const [index, property] of (document?.properties || []).entries()) {
+    if (!isObject(property) || typeof property.name !== 'string' || typeof property.value !== 'string') {
+      issues.push(`properties[${index}] is not a name/value pair`)
+    }
+  }
+  return issues
+}
+
+function checkSbomGeneration({ issues, coverage, digest, fileCount, componentCount, source, extraFailures = [] }) {
+  const evidence = {
+    format: 'CycloneDX',
+    specVersion: CDX_SPEC_VERSION,
+    source,
+    fileCount,
+    filesDigest: `sha256:${digest}`,
+    componentCount,
+    componentCountIncludesRoot: true,
+    coverage: coverage.coverage,
+    gaps: coverage.gaps,
+    runtimeComponents: coverage.runtimeComponents,
+    unresolvedRuntime: coverage.unresolvedRuntime,
+    signed: false,
+    attested: false,
+    validation: issues.length ? issues : 'ok',
+  }
+  if (extraFailures.length) {
+    return makeCheck('SC-02', 'SBOM generation (CycloneDX 1.5)', 'FAIL', extraFailures.join('; '), evidence)
+  }
+  if (issues.length) {
+    return makeCheck('SC-02', 'SBOM generation (CycloneDX 1.5)', 'FAIL',
+      `generated CycloneDX document failed structural validation: ${issues.slice(0, 3).join('; ')}`, evidence)
+  }
+  if (coverage.coverage !== 'full') {
+    return makeCheck('SC-02', 'SBOM generation (CycloneDX 1.5)', 'UNKNOWN',
+      `CycloneDX 1.5 generated but coverage is partial: ${coverage.gaps.join('; ')}; local SBOM is unsigned`, evidence)
+  }
+  return makeCheck('SC-02', 'SBOM generation (CycloneDX 1.5)', 'PASS',
+    `CycloneDX 1.5 generated: ${componentCount} component(s), ${fileCount} file(s), files digest sha256:${digest.slice(0, 16)}…; local SBOM is unsigned/not attested`,
+    evidence)
+}
+
+// ---------------------------------------------------------------------------
+// revocation lookup (OSV)
+// ---------------------------------------------------------------------------
+
+function osvAdvisorySummary(vuln) {
+  const fixed = []
+  for (const affected of Array.isArray(vuln?.affected) ? vuln.affected : []) {
+    for (const range of Array.isArray(affected?.ranges) ? affected.ranges : []) {
+      for (const event of Array.isArray(range?.events) ? range.events : []) {
+        if (typeof event?.fixed === 'string' && event.fixed) fixed.push(event.fixed)
+      }
+    }
+  }
+  return {
+    id: vuln?.id ?? null,
+    aliases: Array.isArray(vuln?.aliases) ? vuln.aliases : [],
+    modified: vuln?.modified ?? null,
+    published: vuln?.published ?? null,
+    withdrawn: vuln?.withdrawn ?? null,
+    summary: short(vuln?.summary || '', 200),
+    severity: Array.isArray(vuln?.severity)
+      ? vuln.severity.map((item) => ({ type: item?.type ?? null, score: item?.score ?? null })).slice(0, 5)
+      : [],
+    fixed: [...new Set(fixed)].slice(0, 10),
+  }
+}
+
+async function queryOsv(name, version) {
+  const payload = {
+    package: { name, ecosystem: 'npm' },
+    version,
+  }
+  const response = await postJson(OSV_API, payload)
+  if (!isObject(response)) throw new Error('OSV response is not a JSON object')
+  if (response.vulns !== undefined && !Array.isArray(response.vulns)) {
+    throw new Error('OSV response has a non-array vulns field')
+  }
+  return {
+    payload,
+    vulns: response.vulns || [],
+    nextPageToken: response.next_page_token || null,
+  }
+}
+
+function checkRevocation({ name, version, result = null, error = null, queriedAt }) {
+  const evidence = {
+    source: 'osv',
+    endpoint: OSV_API,
+    ecosystem: 'npm',
+    package: name,
+    version,
+    queriedAt,
+    cache: 'disabled',
+    signed: false,
+    advisoryCount: 0,
+    withdrawnCount: 0,
+    advisories: [],
+    nextPageToken: null,
+    error: error ? short(error, 300) : null,
+  }
+  if (error) {
+    return {
+      check: makeCheck('SC-06', 'revocation query (OSV)', 'UNKNOWN',
+        `OSV query failed (${short(error, 120)}); absence of advisories cannot be established and no cached result is used`,
+        evidence),
+      field: {
+        ...evidence,
+        status: 'unknown',
+        reason: 'OSV query failed; UNKNOWN, not PASS',
+      },
+    }
+  }
+  const objects = result.vulns.filter((vuln) => isObject(vuln))
+  const malformed = result.vulns.length - objects.length
+  const active = objects.filter((vuln) => !vuln.withdrawn)
+  const withdrawn = objects.length - active.length
+  evidence.advisoryCount = active.length
+  evidence.withdrawnCount = withdrawn
+  evidence.advisories = active.slice(0, 20).map(osvAdvisorySummary)
+  evidence.nextPageToken = result.nextPageToken
+  if (malformed > 0 && active.length === 0) {
+    return {
+      check: makeCheck('SC-06', 'revocation query (OSV)', 'UNKNOWN',
+        `OSV returned ${malformed} malformed advisory record(s); the result cannot be treated as clear`, evidence),
+      field: { ...evidence, status: 'unknown', reason: 'malformed OSV result; UNKNOWN, not PASS' },
+    }
+  }
+  if (result.nextPageToken && active.length === 0) {
+    return {
+      check: makeCheck('SC-06', 'revocation query (OSV)', 'UNKNOWN',
+        'OSV returned a pagination token with no advisories; pagination is not implemented, so the result is UNKNOWN', evidence),
+      field: { ...evidence, status: 'unknown', reason: 'OSV pagination not implemented; UNKNOWN, not PASS' },
+    }
+  }
+  if (active.length > 0) {
+    const ids = active.slice(0, 5).map((vuln) => vuln.id || 'unknown').join(', ')
+    return {
+      check: makeCheck('SC-06', 'revocation query (OSV)', 'FAIL',
+        `OSV reports ${active.length} active advisory(ies) affecting ${name}@${version}: ${ids}${active.length > 5 ? ', …' : ''}`,
+        evidence),
+      field: {
+        ...evidence,
+        status: 'advisories-found',
+        reason: 'OSV advisory affects this exact version; treat as revoked until reviewed',
+      },
+    }
+  }
+  const withdrawnSuffix = withdrawn ? ` (${withdrawn} withdrawn advisory record(s) ignored)` : ''
+  return {
+    check: makeCheck('SC-06', 'revocation query (OSV)', 'PASS',
+      `OSV reports no active advisories for ${name}@${version}${withdrawnSuffix}; point-in-time unsigned advisory query, not a signed revocation list`,
+      evidence),
+    field: {
+      ...evidence,
+      status: 'clear',
+      reason: 'OSV returned no active advisories; unsigned point-in-time result',
+    },
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -876,10 +1557,11 @@ async function verifyNpm(input) {
   if (!spec.name) throw new Error(`invalid package spec: ${input}`)
   const meta = await fetchVersion(spec.name, spec.version)
   const artifact = await loadTarball(meta)
+  const provenanceCheck = await checkProvenance(meta, artifact)
   const checks = [
     checkRemoteIntegrity(meta, artifact),
     checkSignature(meta, artifact),
-    await checkProvenance(meta, artifact),
+    provenanceCheck,
   ]
   return buildReport({
     command: 'verify',
@@ -911,31 +1593,291 @@ async function verifyNpm(input) {
         fileCount: artifact.stats?.fileCount ?? null,
       },
     },
+    provenance: provenanceSummary(provenanceCheck),
+  })
+}
+
+function repositoryUrl(manifest) {
+  const repository = manifest?.repository
+  if (typeof repository === 'string') return repository
+  if (isObject(repository) && typeof repository.url === 'string') return repository.url
+  if (typeof manifest?.homepage === 'string') return manifest.homepage
+  return null
+}
+
+async function sbomDir(input) {
+  const dir = resolve(input)
+  const { manifest, file } = loadLocalPackage(dir)
+  const name = typeof manifest.name === 'string' ? manifest.name : ''
+  const version = typeof manifest.version === 'string' ? manifest.version : ''
+  if (!name || !version) throw new Error('package.json must declare name and version to build an SBOM')
+  const inventory = localFileInventory(dir)
+  const rootLicense = licenseEntries(manifest.license)
+  const lock = loadLocalSbomComponents(dir, manifest)
+  const components = lock.components
+  const coverage = evaluateSbomCoverage({
+    components,
+    inventory,
+    rootLicense,
+    componentsTruncated: components.length >= MAX_SBOM_COMPONENTS,
+  })
+  const digest = filesDigest(inventory.files)
+  const rootHashes = [{ alg: 'SHA-256', content: digest }]
+  const { document } = buildCycloneDx({
+    name,
+    version,
+    source: 'dir',
+    rootHashes,
+    rootLicense,
+    components,
+    inventory,
+    coverage,
+    distributionUrl: null,
+    repositoryUrl: repositoryUrl(manifest),
+    extraProperties: [
+      { name: 'testatum:lockfile', value: lock.lockfile || 'none' },
+      { name: 'testatum:dependencyResolution', value: lock.resolution },
+      ...(lock.warning ? [{ name: 'testatum:resolutionWarning', value: lock.warning }] : []),
+    ],
+  })
+  const issues = validateCycloneDx(document)
+  const check = checkSbomGeneration({
+    issues,
+    coverage,
+    digest,
+    fileCount: inventory.files.length,
+    componentCount: 1 + components.length,
+    source: 'local-dir',
+  })
+  return buildReport({
+    command: 'sbom',
+    target: {
+      input,
+      type: 'dir',
+      name,
+      version,
+      path: dir,
+      manifestPath: file,
+    },
+    checks: [check],
+    evidence: {
+      sbom: check.evidence,
+      source: {
+        type: 'dir',
+        path: dir,
+        manifestPath: file,
+        lockfile: lock.lockfile,
+        dependencyResolution: lock.resolution,
+        warning: lock.warning,
+      },
+      files: {
+        count: inventory.files.length,
+        digest: `sha256:${digest}`,
+        truncated: inventory.truncated,
+        unreadable: inventory.unreadable,
+        oversized: inventory.oversized,
+        sample: inventory.files.slice(0, 10),
+      },
+      components: {
+        count: components.length,
+        runtime: components.filter((item) => item.dependencyType !== 'dev').length,
+        unresolved: components.filter((item) => !item.version).map((item) => item.name),
+        sample: components.slice(0, 10).map((item) => ({
+          name: item.name,
+          version: item.version,
+          dependencyType: item.dependencyType,
+          hashes: item.hashes.length,
+        })),
+      },
+    },
+    sbom: document,
+  })
+}
+
+async function sbomNpm(input) {
+  const spec = parseSpec(input)
+  if (!spec.name) throw new Error(`invalid package spec: ${input}`)
+  const meta = await fetchVersion(spec.name, spec.version)
+  const artifact = await loadTarball(meta)
+  if (!artifact.buffer || !artifact.tar) {
+    throw new Error(`tarball unavailable: ${artifact.error || 'unknown error'}`)
+  }
+  const manifest = artifact.manifest
+  if (!manifest) throw new Error('tarball package.json could not be parsed')
+  const name = typeof manifest.name === 'string' ? manifest.name : meta.name
+  const version = typeof manifest.version === 'string' ? manifest.version : meta.version
+  if (!name || !version) throw new Error('package manifest must declare name and version to build an SBOM')
+
+  const inventory = tarFileInventory(artifact.tar)
+  const rootLicense = licenseEntries(manifest.license)
+  let components
+  let resolution
+  let lockfile = null
+  const embeddedLock = artifact.tar ? (readTarText(artifact.tar, 'package-lock.json') || readTarText(artifact.tar, 'npm-shrinkwrap.json')) : null
+  if (embeddedLock) {
+    try {
+      components = componentsFromNpmLock(JSON.parse(embeddedLock), 'tarball-lockfile')
+      resolution = 'tarball-lockfile'
+      lockfile = 'package-lock.json'
+    } catch {
+      components = componentsFromManifest(manifest, 'npm')
+      resolution = 'declared-ranges'
+    }
+  } else {
+    components = componentsFromManifest(manifest, 'npm')
+    resolution = 'declared-ranges'
+  }
+  const coverage = evaluateSbomCoverage({
+    components,
+    inventory,
+    rootLicense,
+    componentsTruncated: components.length >= MAX_SBOM_COMPONENTS,
+  })
+  const digest = filesDigest(inventory.files)
+  const rootHashes = [
+    { alg: 'SHA-512', content: sha512Hex(artifact.buffer) },
+    { alg: 'SHA-256', content: sha256Hex(artifact.buffer) },
+  ]
+  const expectedSha512 = extractSha512(meta?.dist?.integrity)
+  const digestMatches = expectedSha512 ? createHash('sha512').update(artifact.buffer).digest('base64') === expectedSha512 : null
+  const { document } = buildCycloneDx({
+    name,
+    version,
+    source: 'npm',
+    rootHashes,
+    rootLicense,
+    components,
+    inventory,
+    coverage,
+    distributionUrl: meta?.dist?.tarball ?? null,
+    repositoryUrl: repositoryUrl(manifest),
+    extraProperties: [
+      { name: 'testatum:registryIntegrity', value: meta?.dist?.integrity ?? 'none' },
+      { name: 'testatum:registryIntegrityMatches', value: String(digestMatches) },
+      { name: 'testatum:dependencyResolution', value: resolution },
+      ...(lockfile ? [{ name: 'testatum:embeddedLockfile', value: lockfile }] : []),
+    ],
+  })
+  const issues = validateCycloneDx(document)
+  const extraFailures = []
+  if (digestMatches === false) extraFailures.push('tarball bytes do not match dist.integrity; SBOM hashes are computed from the fetched bytes, not the registry declaration')
+  if (manifest.name !== meta.name || manifest.version !== meta.version) {
+    extraFailures.push(`tarball package.json is ${manifest.name}@${manifest.version}, expected ${meta.name}@${meta.version}`)
+  }
+  const check = checkSbomGeneration({
+    issues,
+    coverage,
+    digest,
+    fileCount: inventory.files.length,
+    componentCount: 1 + components.length,
+    source: 'npm-tarball',
+    extraFailures,
+  })
+  return buildReport({
+    command: 'sbom',
+    target: {
+      input,
+      type: 'npm',
+      name,
+      version,
+      registry: REGISTRY,
+      tarball: meta?.dist?.tarball ?? null,
+    },
+    checks: [check],
+    evidence: {
+      sbom: check.evidence,
+      source: {
+        type: 'npm-tarball',
+        registry: REGISTRY,
+        tarball: meta?.dist?.tarball ?? null,
+        integrity: meta?.dist?.integrity ?? null,
+        integrityMatches: digestMatches,
+        dependencyResolution: resolution,
+        embeddedLockfile: lockfile,
+        tarballFiles: artifact.stats?.fileCount ?? null,
+      },
+      files: {
+        count: inventory.files.length,
+        digest: `sha256:${digest}`,
+        truncated: inventory.truncated,
+        sample: inventory.files.slice(0, 10),
+      },
+      components: {
+        count: components.length,
+        runtime: components.filter((item) => item.dependencyType !== 'dev').length,
+        unresolved: components.filter((item) => !item.version).map((item) => item.name),
+        sample: components.slice(0, 10).map((item) => ({
+          name: item.name,
+          version: item.version,
+          dependencyType: item.dependencyType,
+          hashes: item.hashes.length,
+        })),
+      },
+    },
+    sbom: document,
+  })
+}
+
+async function revocationNpm(input) {
+  const targetPath = resolve(input)
+  if (existsSync(targetPath) && statSync(targetPath).isDirectory()) {
+    throw new Error('revocation expects an npm package spec, not a directory')
+  }
+  const spec = parseSpec(input)
+  if (!spec.name) throw new Error(`invalid package spec: ${input}`)
+  if (!spec.version) throw new Error(`revocation requires an exact version: ${input} (use <pkg>@<version>)`)
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(spec.version)) {
+    throw new Error(`revocation requires an exact semver version, got "${spec.version}"`)
+  }
+  const queriedAt = new Date().toISOString()
+  let result = null
+  let error = null
+  try {
+    result = await queryOsv(spec.name, spec.version)
+  } catch (caught) {
+    error = describeError(caught)
+  }
+  const { check, field } = checkRevocation({ name: spec.name, version: spec.version, result, error, queriedAt })
+  return buildReport({
+    command: 'revocation',
+    target: {
+      input,
+      type: 'npm',
+      name: spec.name,
+      version: spec.version,
+      registry: REGISTRY,
+      osvEndpoint: OSV_API,
+    },
+    checks: [check],
+    evidence: {
+      revocation: field,
+    },
+    revocation: field,
   })
 }
 
 function policyRequirements() {
   return [
-    { id: 'SC-01', title: 'artifact signature and verification', level: 'MUST', v01: 'presence only; verify reports UNKNOWN', default: 'strict missing evidence => DENY' },
-    { id: 'SC-02', title: 'SBOM and dependency inventory', level: 'MUST', v01: 'not implemented (fields reported only)', default: 'strict new release without SBOM => DENY' },
-    { id: 'SC-03', title: 'install scripts denied by default', level: 'MUST', v01: 'implemented for pre/install/postinstall/prepare', default: 'DENY in all modes' },
-    { id: 'SC-04', title: 'capability declaration and consistency', level: 'MUST', v01: 'declaration shape + dangerous literals only', default: 'undeclared high risk => DENY/WARN' },
-    { id: 'SC-05', title: 'CVE and vulnerability response', level: 'MUST', v01: 'not implemented', default: 'KEV/CVSS>=9 => DENY' },
-    { id: 'SC-06', title: 'signed revocation list', level: 'MUST', v01: 'not implemented (policy only)', default: 'revoked/unreachable => DENY/WARN' },
-    { id: 'SC-07', title: 'provenance and commit pinning', level: 'MUST', v01: 'digest verified; provenance presence only => UNKNOWN', default: 'strict missing provenance => DENY' },
-    { id: 'SC-08', title: 'reproducible builds', level: 'MUST', v01: 'not implemented', default: 'strict missing evidence => DENY' },
-    { id: 'SC-09', title: 'least privilege', level: 'MUST', v01: 'danger-full-access / credentials literal scan only', default: 'dangerous grant => DENY' },
-    { id: 'SC-10', title: 'install audit log', level: 'MUST', v01: 'not implemented', default: 'strict without audit => DENY' },
+    { id: 'SC-01', title: 'artifact signature and verification', level: 'MUST', v01: 'presence only; verify reports UNKNOWN', v02: 'presence only; registry signatures never verified (UNKNOWN)', default: 'strict missing evidence => DENY' },
+    { id: 'SC-02', title: 'SBOM and dependency inventory', level: 'MUST', v01: 'not implemented (fields reported only)', v02: 'local CycloneDX 1.5 via `sbom`; unsigned, no attestation; tarball dependency ranges may stay unresolved', default: 'strict new release without SBOM => DENY' },
+    { id: 'SC-03', title: 'install scripts denied by default', level: 'MUST', v01: 'implemented for pre/install/postinstall/prepare', v02: 'implemented for pre/install/postinstall/prepare; still static only', default: 'DENY in all modes' },
+    { id: 'SC-04', title: 'capability declaration and consistency', level: 'MUST', v01: 'declaration shape + dangerous literals only', v02: 'declaration shape + dangerous literals only; no AST/runtime observation', default: 'undeclared high risk => DENY/WARN' },
+    { id: 'SC-05', title: 'CVE and vulnerability response', level: 'MUST', v01: 'not implemented', v02: 'on-demand OSV query via `revocation`; no continuous monitoring or KEV feed', default: 'KEV/CVSS>=9 => DENY' },
+    { id: 'SC-06', title: 'signed revocation list', level: 'MUST', v01: 'not implemented (policy only)', v02: 'on-demand unsigned OSV advisory query; signed revocation list/TTL not implemented', default: 'revoked/unreachable => DENY/WARN' },
+    { id: 'SC-07', title: 'provenance and commit pinning', level: 'MUST', v01: 'digest verified; provenance presence only => UNKNOWN', v02: 'digest verified; npm attestation presence recorded; always UNKNOWN, never PASS', default: 'strict missing provenance => DENY' },
+    { id: 'SC-08', title: 'reproducible builds', level: 'MUST', v01: 'not implemented', v02: 'not implemented', default: 'strict missing evidence => DENY' },
+    { id: 'SC-09', title: 'least privilege', level: 'MUST', v01: 'danger-full-access / credentials literal scan only', v02: 'danger-full-access / credentials literal scan only', default: 'dangerous grant => DENY' },
+    { id: 'SC-10', title: 'install audit log', level: 'MUST', v01: 'not implemented', v02: 'not implemented', default: 'strict without audit => DENY' },
   ]
 }
 
 function policyHuman() {
   const lines = []
-  lines.push(`testatum ${VERSION} — DSH supply-chain policy (baseline v0.1, 2026-11-14)`)
+  lines.push(`testatum ${VERSION} — DSH supply-chain policy (baseline v0.1.0-draft, 2026-11-14)`)
   lines.push('')
   for (const item of policyRequirements()) {
     lines.push(`${item.id}  ${item.title}`)
-    lines.push(`      v0.1: ${item.v01}`)
+    lines.push(`      v0.2: ${item.v02}`)
     lines.push(`      default: ${item.default}`)
   }
   lines.push('')
@@ -944,7 +1886,8 @@ function policyHuman() {
   lines.push('missing, expired or unreachable evidence is never reported as PASS.')
   lines.push('')
   lines.push('Exit codes: 0 = pass; 1 = fail; 2 = unknown (unverifiable evidence or usage error).')
-  lines.push('v0.1 does not perform cryptographic verification and must not be used as a security gate.')
+  lines.push('v0.2 does not perform cryptographic verification and must not be used as a security gate.')
+  lines.push('OSV advisories are unsigned, point-in-time data and are never cached.')
   return lines.join('\n')
 }
 
@@ -956,6 +1899,18 @@ function policyJson() {
     generatedAt: new Date().toISOString(),
     baseline: { name: 'DSH Plugin Supply-Chain Baseline', version: '0.1.0-draft', date: '2026-11-14' },
     requirements: policyRequirements(),
+    commands: {
+      scan: 'static manifest, lifecycle-script, capability and integrity checks',
+      verify: 'registry digest + signature/provenance presence (never PASS on provenance)',
+      sbom: 'generate a local CycloneDX 1.5 SBOM (unsigned; no attestation)',
+      revocation: 'fresh OSV advisory query for one exact version (no cache; network failure = UNKNOWN)',
+      policy: 'print the 10 baseline requirements and exit-code contract',
+    },
+    schemaExtensions: {
+      sbom: 'CycloneDX 1.5 JSON object when command=sbom, otherwise null',
+      revocation: 'OSV query result when command=revocation, otherwise null',
+      provenance: 'presence summary when command=verify, otherwise null',
+    },
     modes: {
       strict: 'missing evidence => DENY; install scripts => DENY; revoked/KEV => DENY',
       balanced: 'missing evidence => WARN + explicit approval; install scripts => DENY; revoked/KEV => DENY',
@@ -975,22 +1930,29 @@ function helpText() {
     `testatum ${VERSION} — static supply-chain checker prototype (schema ${SCHEMA})`,
     '',
     'Usage:',
-    '  testatum scan <pkg|dir>   inspect manifest, lifecycle scripts, files and lockfile/digest',
-    '  testatum verify <pkg>     inspect registry integrity, provenance and signature presence',
-    '  testatum policy           print the 10 baseline requirements and exit-code contract',
-    '  testatum version          print version',
-    '  testatum help             print this help',
+    '  testatum scan <pkg|dir>           inspect manifest, lifecycle scripts, files and lockfile/digest',
+    '  testatum verify <pkg>             inspect registry integrity, signature and provenance PRESENCE',
+    '  testatum sbom <pkg|dir>           generate a local CycloneDX 1.5 SBOM (unsigned)',
+    '  testatum revocation <pkg@ver>     query OSV for advisories affecting one exact version',
+    '  testatum policy                   print the 10 baseline requirements and exit-code contract',
+    '  testatum version                  print version',
+    '  testatum help                     print this help',
     '',
     'Options:',
-    '  --json    JSON only (scan/verify already write JSON to stdout; suppress the stderr summary)',
+    '  --json    JSON only (scan/verify/sbom/revocation already write JSON to stdout; suppress the stderr summary)',
+    '  --cdx     with sbom: print only the CycloneDX 1.5 document',
     '',
     'Examples:',
     '  node testatum.mjs scan .',
     '  node testatum.mjs scan dsh-auto-review@0.15.1',
     '  node testatum.mjs verify dsh-permission-rules@0.8.0',
+    '  node testatum.mjs sbom dsh-auto-review@0.15.1',
+    '  node testatum.mjs sbom . --cdx > sbom.cdx.json',
+    '  node testatum.mjs revocation lodash@4.17.19',
     '  node testatum.mjs policy --json',
     '',
-    'Exit codes: 0 pass / 1 fail / 2 unknown. v0.1 never executes package code or lifecycle scripts.',
+    'Exit codes: 0 pass / 1 fail / 2 unknown. v0.2 never executes package code or lifecycle scripts.',
+    'OSV results are never cached; network failure is UNKNOWN, never PASS.',
   ].join('\n')
 }
 
@@ -1000,7 +1962,8 @@ function helpText() {
 
 async function main(argv) {
   const jsonOnly = argv.includes('--json')
-  const args = argv.filter((arg) => arg !== '--json')
+  const cdxOnly = argv.includes('--cdx')
+  const args = argv.filter((arg) => arg !== '--json' && arg !== '--cdx')
   const [command, ...rest] = args
 
   if (!command || command === 'help' || command === '--help' || command === '-h') {
@@ -1019,6 +1982,49 @@ async function main(argv) {
       console.log(policyHuman())
     }
     return 0
+  }
+
+  if (command === 'sbom') {
+    const input = rest[0]
+    if (!input) {
+      console.error('testatum: sbom requires <pkg|dir>')
+      return 2
+    }
+    let report
+    try {
+      const targetPath = resolve(input)
+      if (existsSync(targetPath) && statSync(targetPath).isDirectory()) {
+        report = await sbomDir(input)
+      } else {
+        report = await sbomNpm(input)
+      }
+    } catch (error) {
+      report = errorReport('sbom', { input, type: input.startsWith('.') || input.includes('/') ? 'dir' : 'npm' }, error)
+    }
+    if (cdxOnly && report.sbom) {
+      console.log(JSON.stringify(report.sbom, null, 2))
+      return report.exitCode
+    }
+    console.log(JSON.stringify(report, null, 2))
+    if (!jsonOnly && !cdxOnly) console.error(renderSummary(report))
+    return report.exitCode
+  }
+
+  if (command === 'revocation') {
+    const input = rest[0]
+    if (!input) {
+      console.error('testatum: revocation requires <pkg@version>')
+      return 2
+    }
+    let report
+    try {
+      report = await revocationNpm(input)
+    } catch (error) {
+      report = errorReport('revocation', { input, type: 'npm' }, error)
+    }
+    console.log(JSON.stringify(report, null, 2))
+    if (!jsonOnly) console.error(renderSummary(report))
+    return report.exitCode
   }
 
   if (command === 'scan') {

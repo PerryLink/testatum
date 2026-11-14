@@ -2,6 +2,7 @@
   "name": "testatum-fixture-clean",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
   "description": "Negative-control fixture: no lifecycle scripts, capabilities declared.",
   "main": "index.js",
   "files": [

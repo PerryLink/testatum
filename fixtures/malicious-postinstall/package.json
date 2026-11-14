@@ -2,6 +2,7 @@
   "name": "testatum-fixture-malicious",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
   "description": "Positive-control fixture: postinstall must be reported FAIL and never executed.",
   "main": "index.js",
   "files": [

@@ -1,7 +1,7 @@
 {
   "name": "testatum",
-  "version": "0.1.0",
-  "description": "Static supply-chain checker for DSH plugin artifacts (single file, zero runtime deps). Experimental: not a security gate.",
+  "version": "0.2.0",
+  "description": "Static supply-chain checker for DSH plugin artifacts with CycloneDX SBOM and OSV advisory lookup (single file, zero runtime deps). Experimental: not a security gate.",
   "type": "module",
   "bin": {
     "testatum": "./testatum.mjs"
