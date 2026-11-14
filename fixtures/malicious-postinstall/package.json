@@ -1,0 +1,19 @@
+{
+  "name": "testatum-fixture-malicious",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Positive-control fixture: postinstall must be reported FAIL and never executed.",
+  "main": "index.js",
+  "files": [
+    "index.js"
+  ],
+  "scripts": {
+    "postinstall": "node -e \"require('fs').writeFileSync('PWNED-BY-POSTINSTALL','owned')\""
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "capabilities": [
+      "tools:register"
+    ]
+  }
+}
