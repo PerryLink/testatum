@@ -3,7 +3,7 @@
 Single-file, zero-runtime-dependency supply-chain checker for DSH plugin artifacts.
 Built from `artifacts/supply-chain-baseline.md` (v0.1.0-draft, 2026-11-14).
 
-npm status: **staged** (`testatum@0.0.0-stage` placeholder) pending 2FA approval; use the GitHub source until `0.1.0` is live.
+npm: **`testatum@0.1.0` is live** — `npx testatum ...`.
 
 **Experimental. Not a security gate.** v0.1 performs static inspection and digest
 matching only; it does **not** verify cryptographic signatures or provenance, and
