@@ -1,0 +1,16 @@
+{
+  "name": "testatum-fixture-clean",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Negative-control fixture: no lifecycle scripts, capabilities declared.",
+  "main": "index.js",
+  "files": [
+    "index.js"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "capabilities": [
+      "tools:register"
+    ]
+  }
+}
